@@ -1,0 +1,263 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Nov 29 14:44:21 2021
+"""
+
+import pandas as pd
+import numpy as np
+import requests, os, re, threading, glob
+import json, sys, getopt, time, datetime
+
+
+config, starttime, endtime = 'Config_v7.xlsx', '', ''
+model_id, model_ids, thing_ids, serial_nos, filename, replace, mode, modes = '1duB7teTZ16', [], [], [], '', 'yes', '变量-国四通用', {'1': '变量-国四通用', '2': '变量-IDS国三', '3': '变量-TopN', '4': '变量-Portrait'}
+
+class getIOTData:
+
+    def __init__(self, start_time, end_time, model_id, thing_id, columns, filename):
+    
+        self.start_time = start_time
+        self.end_time = end_time
+        self.model_id = model_id
+        self.thing_id = thing_id
+        if 'time' in columns:
+            columns.remove('time')
+        self.columns = columns
+        self.filename = filename
+        self.proxies = {'http': 'http://10.11.225.204:80'}
+        self.auth_data = {"password": "SGHl@123",
+                          "grant_type": "password",
+                          "client_secret": "changeit",
+                          "client_id": "web_app",
+                          "username": "15876501504"}
+        self.url = 'https://openapi.rootcloud.com/historian-manage/v1/historian/models/%s/things' % (self.model_id)
+
+    def update_token(self, auth_data):
+                             
+        return requests.post(url='https://openapi.rootcloud.com/account-manage/v1/auth/login', data=auth_data)
+
+    def get_iot_data(self, para):
+    
+        status_code = 0
+        
+        while status_code != 200:
+        
+            resp = self.update_token(self.auth_data)
+            auth = json.loads(resp.text)['access_token']
+            
+            try:
+                req = requests.get(url=self.url,
+                                   params=para,
+                                   headers={'Content-Type': 'application/json','Access-Control-Allow-Origin': '*',
+                                            'Authorization': 'Bearer ' + auth}, proxies=self.proxies)
+                                            
+                status_code = req.status_code
+                
+                return json.loads(req.text)['payload']
+                
+            except Exception as e:
+    
+            #    print(req.text.encode('utf-8').decode('unicode_escape'))
+                print("获取数据失败，更新authorization之后重新获取...", end = '')
+
+    def loop(self):
+        
+        df = pd.DataFrame() # 定义df为了捕获异常
+        ii, scale, start = 0, 50, time.time()
+    #    print('Loading',end = '')
+        
+        cycles = int((datetime.datetime.strptime(self.end_time[:19], "%Y-%m-%dT%H:%M:%S") - datetime.datetime.strptime(self.start_time[:19], "%Y-%m-%dT%H:%M:%S")).total_seconds() / scale)
+    #    print(cycles)
+        try:
+        
+            while True:
+
+            #    print('.', end = '', flush = True)
+            #        time.sleep(0.1)
+                
+                para = {"modelId": '%s' % self.model_id,
+                        "thingIds": '%s' % json.dumps(self.thing_id),
+                        "startTime": self.start_time,
+                        "endTime": self.end_time,
+                        "properties": json.dumps(self.columns),
+                        "limit": 500,
+                        "skip": 0,
+                        "sort": "ASC",
+                        "queryStrategy": "normal"
+                        }
+
+                data = self.get_iot_data(para)
+                
+                if len(data) == 0: break
+
+    #           文件写入方式改为增量写入，可以看到文件大小变化过程
+    #            df = pd.concat([df, pd.DataFrame(data[0]['rows'], columns=data[0]['columns'])], axis=0)
+                df = pd.DataFrame(data[0]['rows'])
+                
+                start_time = data[0]['rows'][len(data[0]['rows'])-1][0]
+                if len(start_time) == 20: start_time = start_time[:-1]+'.0Z'
+                #增加1毫秒
+                self.start_time = datetime.datetime.strftime(datetime.datetime.strptime(start_time, "%Y-%m-%dT%H:%M:%S.%fZ") + datetime.timedelta(milliseconds=1) ,'%Y-%m-%dT%H:%M:%S.%fZ')[:-4] + 'Z'
+    #            df.iloc[:,0] = df.iloc[:,0].apply(lambda x: datetime.datetime.strptime(x ,'%Y-%m-%d %H:%M:%S.%f')) + datetime.timedelta(hours=8)
+    
+                df.to_csv(self.filename, index=False, header=None, mode='a', encoding='utf-8-sig')
+                
+                a, b, c, dur = '*' * ii, '.' * (scale - ii), (ii / scale) * 100, time.time() - start
+                print('\r{:^3.0f}%[{}->{}]{:.2f}s'.format(c,a,b,dur), end = '')
+                if ((datetime.datetime.strptime(self.end_time[:19], "%Y-%m-%dT%H:%M:%S") - datetime.datetime.strptime(self.start_time[:19], "%Y-%m-%dT%H:%M:%S")).total_seconds() % cycles) < 30: ii += 1
+                
+                if len(df) < 500: break
+                    
+                df = pd.DataFrame()
+                
+            return 0
+            
+        except Exception as e:
+        
+            print(e)
+            return 0 if len(df) == 0 else df.iloc[len(df)-1, 0]
+                
+                
+    def start(self):
+        
+        while(self.start_time != 0):
+        
+            self.start_time = self.loop()
+            
+            if self.start_time == 0: break
+            
+            #增加1毫秒
+            self.start_time = datetime.datetime.strftime(datetime.datetime.strptime(self.start_time, "%Y-%m-%dT%H:%M:%S.%fZ") + datetime.timedelta(milliseconds=1) ,'%Y-%m-%dT%H:%M:%S.%fZ')[:-4] + 'Z'
+                
+            print(self.filename, 'Crashed at', self.start_time, 'Recovery...')
+            time.sleep(2)
+            
+        print('\r{:^3.0f}%[{}->{}]'.format(100,50,0), end = '')
+
+def task():
+
+    global starttime, filename, thingid, endtime
+    
+    with open(filename, 'r', encoding='utf-8') as f:
+        temp = f.readlines()[-1].strip().split(',')[0]
+        if temp.find('T') > 0:#增加1毫秒
+            if temp.find('.') <= 0:
+                temp = temp[:-1] + '.000Z'
+            starttime = datetime.datetime.strftime(datetime.datetime.strptime(temp, "%Y-%m-%dT%H:%M:%S.%fZ") + datetime.timedelta(milliseconds=1) ,'%Y-%m-%dT%H:%M:%S.%fZ')[:-4] + 'Z'
+            print('Recovering at',starttime)
+
+        # SY0857CB02018, 1217740032775, model_id='159Hsm7uAxO', thing_id=["1algK4R3rXi"]  870动作慢       ,SY0859CC30258,1217740035150, 1eEvPaGuEvK    
+    get_data = getIOTData(start_time = starttime,
+                          end_time = endtime,
+                          model_id = model_id,  # 物模型ID，国四通用物模型ID：1duB7teTZ16；375IDS：13UpkT68rZe
+                          thing_id = [thingid],  # 设备ID, 1aDrLd5Pp5e/SY037SCC30918;1biSdESf1V6/SY055ACC32188;1bj0d6yxkgU/SY036TCC65318
+                          columns = model_file['属性ID'].tolist(),
+                          filename = filename)
+    get_data.start()
+
+if __name__ == "__main__":
+
+    try:
+        opts, args = getopt.getopt(sys.argv[1:],'hn:o:R:s:e:m:M:T:',['id=','ofile=','filename=','startTime=','endTime=','modelid=','mode='])
+        	
+    except getopt.GetoptError:
+        
+        print('sac.py -h')
+        sys.exit(2)
+        
+    serials = pd.read_excel(config, sheet_name='机号列表')
+    for opt, arg in opts:
+        if opt == '-h':
+            print('序号', '机号')
+            for index, row in serials.iterrows():
+                print(row['序号'], row['机号'])
+                
+            print('Simple command example: sac.py -n <number> -s <startdate, eg: 20221009> -e <enddate, eg: 20221015> -m <mode, eg: 1>')
+            print('If you know the thing id, command example: sac.py -i <thingid> -o <serial_no>')
+            print('Recovery file, command example: sac.py -R <filename>')
+            print('Get the end time of a file, command example: sac.py -T <filename>')
+            sys.exit()
+            
+        elif opt == '-n':
+            ids = re.split('[/\\,;、，；]', arg)
+            for i in ids:
+                if len(serials[serials['序号']==int(i)]['物模型']):
+                    model_ids.append(serials.loc[int(i)-1,'物模型'])
+                    thing_ids.append(serials.loc[int(i)-1,'物实例'])
+                    serial_nos.append(serials.loc[int(i)-1,'机号'])
+        elif opt in ("-i", "--ifile"):
+            thing_ids = re.split('[/\\,;、，；]', arg)
+        elif opt in ("-o", "--ofile"):
+            serial_nos = re.split('[/\\,;、，；]', arg)
+        elif opt in ("-R", "--recovery"):
+            filename, replace = arg, 'no'
+        elif opt in ("-s", "--startdate"):
+            startdate = datetime.datetime.strptime(arg, '%Y%m%d')
+        elif opt in ("-e", "--enddate"):
+            enddate = datetime.datetime.strptime(arg, '%Y%m%d')
+        elif opt in ("-m", "--mode"):# 1: full fields, 2: TopN, 3: Selected, 4: Portrait
+            mode = modes.get(arg, '变量-国四通用')
+        elif opt in ("-M", "--modelid"):# 3: 13UpkT68rZe, 4: 1duB7teTZ16
+            model_id = model_ids[0] #model_ids.get(arg, '1duB7teTZ16')
+        elif opt in ("-T", "--endTime"):
+            for file in glob.glob('\\'.join([sys.path[0], '*'+arg+'*'])):
+                with open(file, 'r', encoding='utf-8') as f:
+                    print(file, 'end time is', f.readlines()[-1].strip().split(',')[0])
+            sys.exit()
+            
+    if not os.path.exists(config):
+        print('Configuration file is not exists!')
+        sys.exit()
+    
+    model_file = pd.read_excel(config, sheet_name = mode)
+    column_name = model_file['属性名称'].tolist()
+    column_name.insert(0, 'time')
+    
+    if replace == 'no':
+    
+        print('Recoverying', filename, end=' ')
+        filenames = filename.split('_')
+        startdate, enddate = datetime.datetime.strptime(filenames[1], '%Y%m%d'), datetime.datetime.strptime(filenames[1], '%Y%m%d') + datetime.timedelta(days=1)
+        
+        for index, row in serials.iterrows():
+            print(row['序号'], row['机号'])
+            if len(serials[serials['机号']==filenames[0]]['物模型']):
+                model_ids.append(serials[serials['机号']==filenames[0]].loc[0,'物模型'])
+                thing_ids.append(serials[serials['机号']==filenames[0]].loc[0,'物实例'])
+                serial_nos.append(serials[serials['机号']==filenames[0]].loc[0,'机号'])
+            
+    # year, month, startday, endday = startdate[:4], startdate[4:6], int(startdate[-2:]), int(endday) + 1 if startdate[-2:] == endday else int(endday)
+    
+    for i in range(len(thing_ids)):
+    
+        thingid, model_id = thing_ids[i], model_ids[i]
+    
+        # for d in range(startdate, enddate):
+        for d in range((enddate - startdate).days):
+        
+            # day = '0' + str(d) if d < 10 else str(d)
+            # day, nextday = '0' + str(d) if d < 10 else str(d), '0' + str(d + 1) if (d + 1) < 10 else str(d + 1)
+
+            starttime, filename, endtime = ''.join([datetime.datetime.strftime(startdate + datetime.timedelta(days=d), '%Y-%m-%d'), 'T00:00:00.000Z']), '_'.join([serial_nos[i], datetime.datetime.strftime(startdate + datetime.timedelta(days=d), '%Y%m%d'), '.csv']), ''.join([datetime.datetime.strftime(startdate + datetime.timedelta(days=d+1), '%Y-%m-%d'), 'T00:00:00.000Z'])
+            
+            # starttime, filename, endtime = '-'.join([year, month, day]) + 'T00:00:00.000Z', '_'.join([serial_nos[i], ''.join([year,month,day]), '.csv']), '-'.join([year, month, nextday]) + 'T00:00:00.000Z'
+            
+            if replace == 'yes' and os.path.exists(filename):
+                print(filename, 'is exists, do you want to replace it ?', end=' ')
+                replace = input('yes or no:')
+                
+            if (replace == 'yes' or replace == 'y'):
+                print(''.join(['\n', 'Thing id is ', thingid, ', filename is ', filename]))
+                pd.DataFrame(columns = column_name).to_csv(filename, index=False)                
+            else:
+                print(''.join(['\n', 'Thing id is ', thingid, ', Using existing file ', filename]))
+                
+            if len(pd.read_csv(filename, nrows=1).columns) != len(column_name):
+                print('Columns mismatch between config file and', filename)
+                sys.exit()
+            
+            threading.Thread(target = task).start()
+            time.sleep(1)
